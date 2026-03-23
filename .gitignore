@@ -1,0 +1,55 @@
+# JetBrains IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# CMake build directories
+cmake-build-*/
+build/
+out/
+
+# Compiled object files
+*.o
+*.obj
+
+# Compiled binaries / executables
+tinycompiler
+*.exe
+*.out
+*.app
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Debug / core dumps
+*.dSYM/
+core
+*.core
+
+# LLVM IR / bitcode output
+#*.ll
+#*.bc
+
+# AST output files
+*.ast
+
+# Dependency files
+*.d
+
+# Test / scratch JS files
+#test*.js
+
+# macOS metadata
+.DS_Store
+
+# Ninja build files (generated)
+build.ninja
+.ninja_deps
+.ninja_log
