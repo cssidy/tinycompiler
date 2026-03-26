@@ -193,8 +193,13 @@ void CGProcedure::emitStmt(Stmt *S) {
                 Builder.CreateBr(MergeBB);
         }
 
-        Builder.SetInsertPoint(MergeBB);
-        sealBlock(MergeBB);
+        // Only use MergeBB if at least one branch jumps to it otherwise it is dead code.
+        if (MergeBB->hasNPredecessorsOrMore(1)) {
+            Builder.SetInsertPoint(MergeBB);
+            sealBlock(MergeBB);
+        } else {
+            MergeBB->eraseFromParent();
+        }
         break;
     }
     case Stmt::SK_While: {
