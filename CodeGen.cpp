@@ -4,7 +4,7 @@
 
 using namespace tinyjs;
 
-// mangle: _t<len><name>  e.g. gcd -> _t3gcd
+// name mangling: _t<len><name>
 static std::string mangle(llvm::StringRef Name) {
     return "_t" + std::to_string(Name.size()) + Name.str();
 }
@@ -25,7 +25,6 @@ llvm::Value *CGProcedure::readLocalVarRecursive(llvm::BasicBlock *BB, Decl *D) {
     llvm::Value *Val;
     auto &Def = BBDefs[BB];
     if (!Def.Sealed) {
-        // block not yet sealed, add an incomplete phi
         llvm::PHINode *Phi = addEmptyPhi(BB);
         Def.IncompletePhis[D] = Phi;
         Val = Phi;
@@ -33,16 +32,13 @@ llvm::Value *CGProcedure::readLocalVarRecursive(llvm::BasicBlock *BB, Decl *D) {
         auto Preds = llvm::predecessors(BB);
         auto PredIt = Preds.begin();
         if (PredIt == Preds.end()) {
-            // no predecessors, undefined (shouldn't happen in valid programs)
             Val = llvm::UndefValue::get(llvm::Type::getInt64Ty(BB->getContext()));
         } else {
             auto Next = PredIt;
             ++Next;
             if (Next == Preds.end()) {
-                // single predecessor, just recurse
                 Val = readLocalVar(*PredIt, D);
             } else {
-                // multiple predecessors, need a phi
                 llvm::PHINode *Phi = addEmptyPhi(BB);
                 writeLocalVar(BB, D, Phi);
                 Val = addPhiOperands(BB, D, Phi);
@@ -54,7 +50,6 @@ llvm::Value *CGProcedure::readLocalVarRecursive(llvm::BasicBlock *BB, Decl *D) {
 }
 
 llvm::PHINode *CGProcedure::addEmptyPhi(llvm::BasicBlock *BB) {
-    // insert phi at the top of the block
     return llvm::PHINode::Create(
         llvm::Type::getInt64Ty(BB->getContext()), 0, "", BB->begin());
 }
@@ -89,11 +84,18 @@ void CGProcedure::sealBlock(llvm::BasicBlock *BB) {
     Def.Sealed = true;
 }
 
-// zero-extend i1 to i64 when needed in arithmetic context
+// widen i1 booleans to i64 for arithmetic
 llvm::Value *CGProcedure::toI64(llvm::Value *V) {
     if (V->getType()->isIntegerTy(1))
         return Builder.CreateZExt(V, llvm::Type::getInt64Ty(Builder.getContext()));
     return V;
+}
+
+static llvm::StructType *findStructType(llvm::Module *M, llvm::StringRef Name) {
+    for (llvm::StructType *STy : M->getIdentifiedStructTypes())
+        if (STy->getName() == Name)
+            return STy;
+    return nullptr;
 }
 
 llvm::Value *CGProcedure::emitExpr(Expr *E) {
@@ -140,6 +142,26 @@ llvm::Value *CGProcedure::emitExpr(Expr *E) {
             Args.push_back(toI64(emitExpr(Arg)));
         return Builder.CreateCall(Callee, Args);
     }
+
+    case Expr::EK_StringLiteral: {
+        auto *SL = llvm::cast<StringLiteralExpr>(E);
+        llvm::Value *Str = Builder.CreateGlobalString(SL->getValue(), "", 0, Fn->getParent());
+        return Builder.CreatePtrToInt(Str, llvm::Type::getInt64Ty(Builder.getContext()));
+    }
+
+    case Expr::EK_New: {
+        auto *NE = llvm::cast<NewExpr>(E);
+        llvm::LLVMContext &Ctx = Builder.getContext();
+        llvm::Module *M = Fn->getParent();
+        llvm::StructType *STy = findStructType(M, NE->getClass()->getName());
+        llvm::BasicBlock &Entry = Fn->getEntryBlock();
+        llvm::IRBuilder<> AllocaB(&Entry, Entry.begin());
+        llvm::Value *ObjPtr = AllocaB.CreateAlloca(STy, nullptr,
+            llvm::Twine(NE->getClass()->getName()) + ".obj");
+        llvm::Function *InitFn = M->getFunction((NE->getClass()->getName() + "_init").str());
+        Builder.CreateCall(InitFn->getFunctionType(), InitFn, {ObjPtr});
+        return ObjPtr;
+    }
     }
     return nullptr;
 }
@@ -171,20 +193,17 @@ void CGProcedure::emitStmt(Stmt *S) {
             : llvm::BasicBlock::Create(Builder.getContext(), "if.else", Fn);
 
         llvm::Value *Cond = emitExpr(IS->getCond());
-        // ensure i1 for branch condition
         if (!Cond->getType()->isIntegerTy(1))
             Cond = Builder.CreateICmpNE(Cond,
                 llvm::ConstantInt::get(Cond->getType(), 0));
         Builder.CreateCondBr(Cond, ThenBB, ElseBB);
 
-        // then block
         Builder.SetInsertPoint(ThenBB);
         sealBlock(ThenBB);
         emitBlock(IS->getThen());
         if (!Builder.GetInsertBlock()->getTerminator())
             Builder.CreateBr(MergeBB);
 
-        // else block
         if (ElseBB != MergeBB) {
             Builder.SetInsertPoint(ElseBB);
             sealBlock(ElseBB);
@@ -193,7 +212,6 @@ void CGProcedure::emitStmt(Stmt *S) {
                 Builder.CreateBr(MergeBB);
         }
 
-        // Only use MergeBB if at least one branch jumps to it otherwise it is dead code.
         if (MergeBB->hasNPredecessorsOrMore(1)) {
             Builder.SetInsertPoint(MergeBB);
             sealBlock(MergeBB);
@@ -208,10 +226,9 @@ void CGProcedure::emitStmt(Stmt *S) {
         llvm::BasicBlock *BodyBB  = llvm::BasicBlock::Create(Builder.getContext(), "while.body", Fn);
         llvm::BasicBlock *AfterBB = llvm::BasicBlock::Create(Builder.getContext(), "while.after", Fn);
 
-        // jump into the condition block; CondBB is left unsealed (back-edge not yet known)
         Builder.CreateBr(CondBB);
 
-        // emit condition
+        // CondBB is sealed after the body so the back-edge is known
         Builder.SetInsertPoint(CondBB);
         llvm::Value *Cond = emitExpr(WS->getCond());
         if (!Cond->getType()->isIntegerTy(1))
@@ -219,14 +236,12 @@ void CGProcedure::emitStmt(Stmt *S) {
                 llvm::ConstantInt::get(Cond->getType(), 0));
         Builder.CreateCondBr(Cond, BodyBB, AfterBB);
 
-        // emit body
         Builder.SetInsertPoint(BodyBB);
         sealBlock(BodyBB);
         emitBlock(WS->getBody());
         if (!Builder.GetInsertBlock()->getTerminator())
             Builder.CreateBr(CondBB);
 
-        // now the back-edge is known, seal CondBB
         sealBlock(CondBB);
 
         Builder.SetInsertPoint(AfterBB);
@@ -247,6 +262,70 @@ void CGProcedure::emitStmt(Stmt *S) {
         emitExpr(CS->getCall());
         break;
     }
+
+    case Stmt::SK_MethodCall: {
+        auto *MCS = llvm::cast<MethodCallStmt>(S);
+        llvm::LLVMContext &Ctx = Builder.getContext();
+        llvm::Module *M = Fn->getParent();
+
+        llvm::Value *ThisPtr = readLocalVar(Builder.GetInsertBlock(), MCS->getObjDecl());
+
+        llvm::Value *VTablePtr = Builder.CreateLoad(Builder.getPtrTy(), ThisPtr, "vtable");
+        unsigned Slot = MCS->getMethod()->getVTableIndex();
+        llvm::Value *SlotAddr = Builder.CreateInBoundsGEP(
+            Builder.getPtrTy(), VTablePtr, Builder.getInt64(Slot), "fn.slot");
+        llvm::FunctionType *MethodFTy = llvm::FunctionType::get(
+            Builder.getPtrTy(), {Builder.getPtrTy()}, false);
+        llvm::Value *FnPtr = Builder.CreateLoad(Builder.getPtrTy(), SlotAddr, "fn");
+
+        if (!Fn->hasPersonalityFn()) {
+            if (llvm::Function *PersFn = M->getFunction("__gxx_personality_v0"))
+                Fn->setPersonalityFn(PersFn);
+        }
+
+        llvm::BasicBlock *ContBB = llvm::BasicBlock::Create(Ctx, "invoke.cont", Fn);
+        llvm::BasicBlock *LPadBB = llvm::BasicBlock::Create(Ctx, "lpad", Fn);
+        llvm::BasicBlock *CatchBB = llvm::BasicBlock::Create(Ctx, "catch", Fn);
+        llvm::BasicBlock *ResumeBB = llvm::BasicBlock::Create(Ctx, "resume", Fn);
+        Builder.CreateInvoke(MethodFTy, FnPtr, ContBB, LPadBB, {ThisPtr});
+
+        Builder.SetInsertPoint(LPadBB);
+        sealBlock(LPadBB);
+        llvm::StructType *ExcTy = llvm::StructType::get(
+            Builder.getPtrTy(), llvm::Type::getInt32Ty(Ctx));
+        llvm::LandingPadInst *LP = Builder.CreateLandingPad(ExcTy, 1, "exc");
+        llvm::GlobalVariable *ZTIi = M->getNamedGlobal("_ZTIi");
+        if (ZTIi)
+            LP->addClause(ZTIi);
+        else
+            LP->setCleanup(true);
+        llvm::Value *ExcPtr = Builder.CreateExtractValue(LP, 0, "exc.ptr");
+        llvm::Value *ExcSel = Builder.CreateExtractValue(LP, 1, "exc.sel");
+        llvm::Function *TypeIdFn = llvm::Intrinsic::getOrInsertDeclaration(
+            M, llvm::Intrinsic::eh_typeid_for, {Builder.getPtrTy()});
+        llvm::Value *TypeId = Builder.CreateCall(
+            TypeIdFn, {ZTIi ? (llvm::Value *)ZTIi
+                             : llvm::ConstantPointerNull::get(Builder.getPtrTy())},
+            "typeid");
+        llvm::Value *Matches = Builder.CreateICmpEQ(ExcSel, TypeId, "matches");
+        Builder.CreateCondBr(Matches, CatchBB, ResumeBB);
+
+        Builder.SetInsertPoint(CatchBB);
+        sealBlock(CatchBB);
+        if (llvm::Function *BeginCatch = M->getFunction("__cxa_begin_catch"))
+            Builder.CreateCall(BeginCatch->getFunctionType(), BeginCatch, {ExcPtr});
+        if (llvm::Function *EndCatch = M->getFunction("__cxa_end_catch"))
+            Builder.CreateCall(EndCatch->getFunctionType(), EndCatch, {});
+        Builder.CreateBr(ContBB);
+
+        Builder.SetInsertPoint(ResumeBB);
+        sealBlock(ResumeBB);
+        Builder.CreateResume(LP);
+
+        Builder.SetInsertPoint(ContBB);
+        sealBlock(ContBB);
+        break;
+    }
     }
 }
 
@@ -260,16 +339,36 @@ void CGProcedure::emitBlock(const StmtList &Stmts) {
 }
 
 void CGProcedure::run(FunctionDecl *FD) {
-    llvm::BasicBlock *EntryBB = llvm::BasicBlock::Create(
-        Fn->getContext(), "entry", Fn);
+    llvm::LLVMContext &Ctx = Fn->getContext();
+    llvm::BasicBlock *EntryBB = llvm::BasicBlock::Create(Ctx, "entry", Fn);
     Builder.SetInsertPoint(EntryBB);
+
+    llvm::DIBuilder &DBuilder = CGM.getDIBuilder();
+    llvm::SmallVector<llvm::Metadata *, 8> SigTys;
+    SigTys.push_back(CGM.getDbgI64Ty()); // return type
+    for (size_t i = 0; i < FD->getParams().size(); ++i)
+        SigTys.push_back(CGM.getDbgI64Ty());
+    llvm::DISubroutineType *FuncTy = DBuilder.createSubroutineType(
+        DBuilder.getOrCreateTypeArray(SigTys));
+    llvm::DISubprogram *SP = DBuilder.createFunction(
+        CGM.getCU(), FD->getName(), Fn->getName(),
+        CGM.getDbgFile(), 1, FuncTy, 1,
+        llvm::DISubprogram::FlagPrototyped,
+        llvm::DISubprogram::SPFlagDefinition);
+    Fn->setSubprogram(SP);
+    Builder.SetCurrentDebugLocation(llvm::DILocation::get(Ctx, 1, 1, SP));
 
     // write each formal parameter into the entry block
     unsigned Idx = 0;
     for (Decl *P : FD->getParams()) {
-        llvm::Argument *Arg = Fn->getArg(Idx++);
+        llvm::Argument *Arg = Fn->getArg(Idx);
         Arg->setName(P->getName());
         writeLocalVar(EntryBB, P, Arg);
+        llvm::DILocalVariable *DbgVar = DBuilder.createParameterVariable(
+            SP, P->getName(), Idx + 1, CGM.getDbgFile(), 1, CGM.getDbgI64Ty());
+        DBuilder.insertDeclare(Arg, DbgVar, DBuilder.createExpression(),
+            llvm::DILocation::get(Ctx, 1, 1, SP), EntryBB);
+        ++Idx;
     }
 
     emitBlock(FD->getBody());
@@ -280,7 +379,17 @@ void CGProcedure::run(FunctionDecl *FD) {
     // add a default return if the function fell off the end
     if (!Builder.GetInsertBlock()->getTerminator())
         Builder.CreateRet(
-            llvm::ConstantInt::get(llvm::Type::getInt64Ty(Fn->getContext()), 0));
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(Ctx), 0));
+
+    DBuilder.finalizeSubprogram(SP);
+}
+
+CGModule::CGModule(llvm::Module *M, llvm::StringRef Filename)
+    : M(M), DBuilder(*M) {
+    DbgFile = DBuilder.createFile(Filename, ".");
+    CU = DBuilder.createCompileUnit(
+        llvm::dwarf::DW_LANG_C, DbgFile, "tinycompiler", false, "", 0);
+    DbgI64Ty = DBuilder.createBasicType("i64", 64, llvm::dwarf::DW_ATE_signed);
 }
 
 void CGModule::run(DeclList &Decls) {
@@ -297,14 +406,18 @@ void CGModule::run(DeclList &Decls) {
                                mangle(FD->getName()), M);
     }
 
-    // second pass: emit bodies
+    // second pass: emit bodies with debug metadata
+    unsigned Line = 1;
     for (Decl *D : Decls) {
         auto *FD = llvm::dyn_cast<FunctionDecl>(D);
         if (!FD) continue;
         llvm::Function *Fn = M->getFunction(mangle(FD->getName()));
-        CGProcedure CGP(Fn);
+        CGProcedure CGP(Fn, *this);
         CGP.run(FD);
+        ++Line;
     }
+
+    DBuilder.finalize();
 }
 
 CodeGenerator::CodeGenerator(llvm::StringRef ModuleName) {
@@ -312,6 +425,6 @@ CodeGenerator::CodeGenerator(llvm::StringRef ModuleName) {
 }
 
 void CodeGenerator::run(DeclList &Decls) {
-    CGModule CGM(M);
+    CGModule CGM(M, M->getName());
     CGM.run(Decls);
 }

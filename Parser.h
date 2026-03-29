@@ -17,6 +17,8 @@ namespace tinyjs {
 
         // Parsing methods
         FunctionDecl *parseFunction();
+        ClassDecl *parseClass();
+        bool parseClassMember(ClassDecl *CD);
         bool parseParamList(DeclList &Params);
         bool parseBlock(StmtList &Stmts);
         bool parseStatement(StmtList &Stmts);

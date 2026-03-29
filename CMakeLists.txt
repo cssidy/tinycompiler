@@ -10,7 +10,7 @@ add_definitions(${LLVM_DEFINITIONS})
 llvm_map_components_to_libnames(llvm_libs support core)
 
 add_executable(tinycompiler
-        Lexer.cpp Parser.cpp Sema.cpp CodeGen.cpp main.cpp
+        Lexer.cpp Parser.cpp Sema.cpp CodeGen.cpp ClassGen.cpp main.cpp
 )
 
 target_link_libraries(tinycompiler ${llvm_libs})

@@ -25,17 +25,107 @@ bool Parser::consume(tok::TokenKind Kind) {
 }
 
 DeclList Parser::parse() {
-    DeclList Functions;
+    DeclList Decls;
     while (!Tok.is(tok::eof)) {
         if (Tok.is(tok::kw_function)) {
             if (FunctionDecl *FD = parseFunction())
-                Functions.push_back(FD);
+                Decls.push_back(FD);
+        } else if (Tok.is(tok::kw_class)) {
+            if (ClassDecl *CD = parseClass())
+                Decls.push_back(CD);
         } else {
-            Diags.report(Tok.getLocation(), diag::err_expected_token, "function");
+            Diags.report(Tok.getLocation(), diag::err_expected_token, "function or class");
             advance();
         }
     }
-    return Functions;
+    return Decls;
+}
+
+ClassDecl *Parser::parseClass() {
+    consume(tok::kw_class);
+    if (expect(tok::identifier)) return nullptr;
+    llvm::SMLoc Loc = Tok.getLocation();
+    llvm::StringRef Name = Tok.getText();
+    advance();
+
+    llvm::StringRef BaseName;
+    if (Tok.is(tok::kw_extends)) {
+        advance();
+        if (expect(tok::identifier)) return nullptr;
+        BaseName = Tok.getText();
+        advance();
+    }
+
+    ClassDecl *CD = Actions.actOnClassDecl(Loc, Name, BaseName);
+
+    // resolve base class (must be declared before this class)
+    if (!BaseName.empty()) {
+        ClassDecl *Base = Actions.resolveClass(BaseName);
+        if (Base) CD->setBase(Base);
+        else Diags.report(Loc, diag::err_sym_undeclared, BaseName);
+    }
+
+    if (consume(tok::lbrace)) return CD;
+    while (!Tok.is(tok::rbrace) && !Tok.is(tok::eof))
+        parseClassMember(CD);
+    consume(tok::rbrace);
+
+    // assign vtable indices: inherit base slots, then add new virtual methods
+    unsigned Slot = 0;
+    if (CD->getBase())
+        for (auto *M : CD->getBase()->getMethods())
+            if (M->isVirtual()) ++Slot;
+    for (auto *M : CD->getMethods())
+        if (M->isVirtual()) M->setVTableIndex(Slot++);
+        else {
+            // check if this overrides a base virtual method (same name)
+            if (CD->getBase())
+                for (auto *BM : CD->getBase()->getMethods())
+                    if (BM->isVirtual() && BM->getName() == M->getName())
+                        M->setVTableIndex(BM->getVTableIndex());
+        }
+
+    return CD;
+}
+
+bool Parser::parseClassMember(ClassDecl *CD) {
+    bool IsVirtual = false;
+    if (Tok.is(tok::kw_virtual)) {
+        IsVirtual = true;
+        advance();
+    }
+    if (expect(tok::identifier)) return true;
+    llvm::SMLoc Loc = Tok.getLocation();
+    llvm::StringRef Name = Tok.getText();
+    advance();
+
+    if (!IsVirtual && Tok.is(tok::equal)) {
+        // field: NAME = INTEGER ;
+        advance();
+        long Default = 0;
+        if (Tok.is(tok::integer_literal)) {
+            Default = std::stol(Tok.getText().str());
+            advance();
+        }
+        consume(tok::semi);
+        CD->addField(Actions.actOnFieldDecl(Loc, Name, Default));
+    } else {
+        // method: [virtual] NAME ( params ) block
+        MethodDecl *MD = Actions.actOnMethodDecl(Loc, Name, IsVirtual);
+        Actions.enterScope(MD);
+        DeclList Params;
+        if (consume(tok::lparen)) { Actions.leaveScope(); return true; }
+        if (!Tok.is(tok::rparen))
+            parseParamList(Params);
+        consume(tok::rparen);
+        MD->setParams(Params);
+        StmtList Body;
+        parseBlock(Body);
+        MD->setBody(Body);
+        Actions.leaveScope();
+        CD->addMethod(MD);
+    }
+    return false;
 }
 
 FunctionDecl *Parser::parseFunction() {
@@ -117,6 +207,9 @@ bool Parser::parseVarDecl(StmtList &Stmts) {
     if (Tok.is(tok::equal)) {
         advance();
         Init = parseExpr();
+        // track class type for virtual dispatch resolution
+        if (auto *NE = llvm::dyn_cast_or_null<NewExpr>(Init))
+            if (VD) Actions.recordVarClass(VD, NE->getClass());
     }
     consume(tok::semi);
     if (VD) Stmts.push_back(new VarDeclStmt(VD, Init));
@@ -167,7 +260,35 @@ bool Parser::parseAssignOrCall(StmtList &Stmts) {
     llvm::StringRef Name = Tok.getText();
     advance();
 
-    if (Tok.is(tok::equal)) {
+    if (Tok.is(tok::dot)) {
+        // obj.method(args) virtual dispatch statement
+        advance();
+        if (expect(tok::identifier)) return false;
+        llvm::StringRef MethodName = Tok.getText();
+        advance();
+        Decl *ObjDecl = Actions.actOnVarRef(Loc, Name);
+        ClassDecl *ObjClass = ObjDecl ? Actions.getVarClass(ObjDecl) : nullptr;
+        // find method in class or its base
+        MethodDecl *MD = nullptr;
+        auto findMethod = [&](ClassDecl *CD) {
+            for (auto *M : CD->getMethods())
+                if (M->getName() == MethodName) { MD = M; return; }
+        };
+        if (ObjClass) {
+            findMethod(ObjClass);
+            if (!MD && ObjClass->getBase()) findMethod(ObjClass->getBase());
+        }
+        ExprList Args;
+        consume(tok::lparen);
+        while (!Tok.is(tok::rparen) && !Tok.is(tok::eof)) {
+            Args.push_back(parseExpr());
+            if (Tok.is(tok::comma)) advance();
+        }
+        consume(tok::rparen);
+        consume(tok::semi);
+        if (ObjDecl && ObjClass && MD)
+            Stmts.push_back(new MethodCallStmt(ObjDecl, ObjClass, MD, Args));
+    } else if (Tok.is(tok::equal)) {
         // Assignment
         advance();
         Expr *Val = parseExpr();
@@ -194,8 +315,6 @@ bool Parser::parseAssignOrCall(StmtList &Stmts) {
     }
     return false;
 }
-
-// Expression parsing: comparison > additive > term > factor
 
 Expr *Parser::parseExpr() {
     return parseComparison();
@@ -229,6 +348,28 @@ Expr *Parser::parseTerm() {
 }
 
 Expr *Parser::parsePrimary() {
+    if (Tok.is(tok::kw_new)) {
+        advance();
+        if (expect(tok::identifier)) return nullptr;
+        llvm::SMLoc Loc = Tok.getLocation();
+        llvm::StringRef ClassName = Tok.getText();
+        advance();
+        ClassDecl *CD = Actions.resolveClass(ClassName);
+        if (!CD) Diags.report(Loc, diag::err_sym_undeclared, ClassName);
+        ExprList Args;
+        consume(tok::lparen);
+        while (!Tok.is(tok::rparen) && !Tok.is(tok::eof)) {
+            Args.push_back(parseExpr());
+            if (Tok.is(tok::comma)) advance();
+        }
+        consume(tok::rparen);
+        return CD ? new NewExpr(CD, Args) : nullptr;
+    }
+    if (Tok.is(tok::string_literal)) {
+        llvm::StringRef Val = Tok.getText();
+        advance();
+        return new StringLiteralExpr(Val);
+    }
     if (Tok.is(tok::integer_literal)) {
         long Val = std::stol(Tok.getText().str());
         advance();

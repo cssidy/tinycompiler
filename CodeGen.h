@@ -1,12 +1,15 @@
 #pragma once
 #include "AST.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/ADT/DenseMap.h"
 
 namespace tinyjs {
+
+class CGModule; // forward declaration
 
 // per-block SSA state for the Braun et al. algorithm
 struct BasicBlockDef {
@@ -19,6 +22,7 @@ class CGProcedure {
     llvm::Function *Fn;
     llvm::IRBuilder<> Builder;
     llvm::DenseMap<llvm::BasicBlock *, BasicBlockDef> BBDefs;
+    CGModule &CGM;
 
     void writeLocalVar(llvm::BasicBlock *BB, Decl *D, llvm::Value *Val);
     llvm::Value *readLocalVar(llvm::BasicBlock *BB, Decl *D);
@@ -34,15 +38,25 @@ class CGProcedure {
     void emitBlock(const StmtList &Stmts);
 
 public:
-    CGProcedure(llvm::Function *Fn) : Fn(Fn), Builder(Fn->getContext()) {}
+    CGProcedure(llvm::Function *Fn, CGModule &CGM)
+        : Fn(Fn), Builder(Fn->getContext()), CGM(CGM) {}
     void run(FunctionDecl *FD);
 };
 
 class CGModule {
     llvm::Module *M;
+    llvm::DIBuilder DBuilder;
+    llvm::DICompileUnit *CU;
+    llvm::DIFile *DbgFile;
+    llvm::DIBasicType *DbgI64Ty;
 public:
-    CGModule(llvm::Module *M) : M(M) {}
+    CGModule(llvm::Module *M, llvm::StringRef Filename);
     void run(DeclList &Decls);
+    // accessors used by CGProcedure to attach debug info to functions
+    llvm::DIBuilder &getDIBuilder() { return DBuilder; }
+    llvm::DICompileUnit *getCU() { return CU; }
+    llvm::DIFile *getDbgFile() { return DbgFile; }
+    llvm::DIBasicType *getDbgI64Ty() { return DbgI64Ty; }
 };
 
 class CodeGenerator {

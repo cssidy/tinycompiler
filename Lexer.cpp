@@ -16,6 +16,10 @@ Lexer::Lexer(llvm::SourceMgr &SrcMgr, DiagnosticsEngine &Diags)
     Keywords["return"]   = tok::kw_return;
     Keywords["true"]     = tok::kw_true;
     Keywords["false"]    = tok::kw_false;
+    Keywords["class"]    = tok::kw_class;
+    Keywords["extends"]  = tok::kw_extends;
+    Keywords["virtual"]  = tok::kw_virtual;
+    Keywords["new"]      = tok::kw_new;
 }
 
 void Lexer::skipWhitespaceAndComments() {
@@ -61,6 +65,18 @@ void Lexer::next(Token &T) {
         return;
     }
 
+    // string literal  "..."
+    if (*CurPtr == '"') {
+        ++CurPtr;
+        while (CurPtr < Buffer.end() && *CurPtr != '"')
+            ++CurPtr;
+        T.Kind = tok::string_literal;
+        T.Ptr = Start + 1;
+        T.Length = CurPtr - Start - 1;
+        if (CurPtr < Buffer.end()) ++CurPtr; // skip closing "
+        return;
+    }
+
     // integer literal
     if (isdigit(*CurPtr)) {
         while (CurPtr < Buffer.end() && isdigit(*CurPtr))
@@ -84,6 +100,7 @@ void Lexer::next(Token &T) {
     case '}': form(CurPtr+1, tok::rbrace);  return;
     case ';': form(CurPtr+1, tok::semi);    return;
     case ',': form(CurPtr+1, tok::comma);   return;
+    case '.': form(CurPtr+1, tok::dot);     return;
     case '<': form(CurPtr+1, tok::less);    return;
     case '>': form(CurPtr+1, tok::greater); return;
     case '=':

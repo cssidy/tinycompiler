@@ -1,12 +1,15 @@
+#include "ClassGen.h"
+#include "CodeGen.h"
 #include "Lexer.h"
 #include "Parser.h"
 #include "Sema.h"
-#include "CodeGen.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/FileSystem.h"
 
 using namespace tinyjs;
 
@@ -58,6 +61,18 @@ static void dumpExpr(Expr *E, llvm::raw_ostream &OS, int depth = 0) {
         ind(OS, depth);
         OS << "Call " << C->getDecl()->getName() << "\n";
         for (Expr *Arg : C->getArgs())
+            dumpExpr(Arg, OS, depth + 1);
+        break;
+    }
+    case Expr::EK_StringLiteral:
+        ind(OS, depth);
+        OS << "StringLiteral " << llvm::cast<StringLiteralExpr>(E)->getValue() << "\n";
+        break;
+    case Expr::EK_New: {
+        auto *N = llvm::cast<NewExpr>(E);
+        ind(OS, depth);
+        OS << "New " << N->getClass()->getName() << "\n";
+        for (Expr *Arg : N->getArgs())
             dumpExpr(Arg, OS, depth + 1);
         break;
     }
@@ -116,6 +131,15 @@ static void dumpStmt(Stmt *S, llvm::raw_ostream &OS, int depth = 0) {
         dumpExpr(C->getCall(), OS, depth);
         break;
     }
+    case Stmt::SK_MethodCall: {
+        auto *MC = llvm::cast<MethodCallStmt>(S);
+        ind(OS, depth);
+        OS << "MethodCall " << MC->getObjDecl()->getName() << "."
+           << MC->getMethod()->getName() << "\n";
+        for (Expr *Arg : MC->getArgs())
+            dumpExpr(Arg, OS, depth + 1);
+        break;
+    }
     }
 }
 
@@ -131,6 +155,17 @@ static void dumpDecl(Decl *D, llvm::raw_ostream &OS) {
         OS << ")\n";
         for (Stmt *S : FD->getBody())
             dumpStmt(S, OS, 1);
+    } else if (auto *CD = llvm::dyn_cast<ClassDecl>(D)) {
+        OS << "ClassDecl " << CD->getName();
+        if (CD->getBase()) OS << " extends " << CD->getBase()->getName();
+        OS << "\n";
+        for (auto *F : CD->getFields())
+            OS << "  Field " << F->getName() << " = " << F->getDefaultValue() << "\n";
+        for (auto *M : CD->getMethods()) {
+            OS << "  " << (M->isVirtual() ? "virtual " : "") << "Method " << M->getName() << "\n";
+            for (Stmt *S : M->getBody())
+                dumpStmt(S, OS, 2);
+        }
     }
 }
 
@@ -164,7 +199,6 @@ int main(int argc, const char **argv) {
         return 1;
     }
 
-    //  output filename: strip extension, append -output.ast
     std::string Input = argv[1];
     std::string Stem = Input;
     auto DotPos = Input.rfind('.');
@@ -184,9 +218,10 @@ int main(int argc, const char **argv) {
 
     llvm::outs() << "Parsed successfully. AST written to " << OutputPath << "\n";
 
-    // generate LLVM IR
     std::string IRPath = Stem + ".ll";
     CodeGenerator CG(argv[1]);
+    // classes must be emitted before functions (struct types + ctors used by CodeGen)
+    tinyjs::emitClasses(CG.getModule(), Functions);
     CG.run(Functions);
 
     std::error_code EC2;

@@ -83,3 +83,31 @@ Decl *Sema::actOnFunctionRef(llvm::SMLoc Loc, llvm::StringRef Name) {
         Diags.report(Loc, diag::err_sym_undeclared, Name);
     return D;
 }
+
+ClassDecl *Sema::actOnClassDecl(llvm::SMLoc Loc, llvm::StringRef Name, llvm::StringRef BaseName) {
+    auto *CD = new ClassDecl(CurrentDecl, Loc, Name, BaseName);
+    if (!CurrentScope->insert(CD))
+        Diags.report(Loc, diag::err_sym_declared, Name);
+    ClassTable[Name] = CD;
+    return CD;
+}
+
+FieldDecl *Sema::actOnFieldDecl(llvm::SMLoc Loc, llvm::StringRef Name, long Default) {
+    return new FieldDecl(CurrentDecl, Loc, Name, Default);
+}
+
+MethodDecl *Sema::actOnMethodDecl(llvm::SMLoc Loc, llvm::StringRef Name, bool IsVirtual) {
+    return new MethodDecl(CurrentDecl, Loc, Name, IsVirtual);
+}
+
+ClassDecl *Sema::resolveClass(llvm::StringRef Name) {
+    auto It = ClassTable.find(Name);
+    return It != ClassTable.end() ? It->second : nullptr;
+}
+
+void Sema::recordVarClass(Decl *D, ClassDecl *C) { VarTypes[D] = C; }
+
+ClassDecl *Sema::getVarClass(Decl *D) {
+    auto It = VarTypes.find(D);
+    return It != VarTypes.end() ? It->second : nullptr;
+}

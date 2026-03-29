@@ -46,6 +46,8 @@ namespace tinyjs {
             lparen, rparen, lbrace, rbrace, semi, comma,
             kw_var, kw_function, kw_if, kw_else, kw_while,
             kw_return, kw_true, kw_false,
+            kw_class, kw_extends, kw_virtual, kw_new,
+            dot, string_literal,
         };
     } // namespace tok
 
