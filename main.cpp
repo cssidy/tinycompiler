@@ -1,10 +1,15 @@
 #include "ClassGen.h"
 #include "CodeGen.h"
 #include "Lexer.h"
+#include "Optimizer.h"
 #include "Parser.h"
 #include "Sema.h"
+#include "TinyCPUBackend.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -12,6 +17,21 @@
 #include "llvm/Support/raw_ostream.h"
 
 using namespace tinyjs;
+
+static llvm::cl::opt<signed char> OptLevel(
+    llvm::cl::desc("Optimization level:"),
+    llvm::cl::values(
+        clEnumValN(0, "O0", "No optimization"),
+        clEnumValN(1, "O1", "Optimization level 1"),
+        clEnumValN(2, "O2", "Optimization level 2"),
+        clEnumValN(3, "O3", "Optimization level 3")),
+    llvm::cl::init(0));
+
+static llvm::cl::opt<std::string> PassPipeline(
+    "passes", llvm::cl::desc("Custom pass pipeline description"));
+
+static llvm::cl::opt<std::string> InputFilename(
+    llvm::cl::Positional, llvm::cl::desc("<input file>"), llvm::cl::Required);
 
 static void ind(llvm::raw_ostream &OS, int depth) {
     for (int i = 0; i < depth; ++i)
@@ -171,18 +191,14 @@ static void dumpDecl(Decl *D, llvm::raw_ostream &OS) {
 
 int main(int argc, const char **argv) {
     llvm::InitLLVM X(argc, argv);
-
-    if (argc < 2) {
-        llvm::errs() << "Usage: tinycompiler <file>\n";
-        return 1;
-    }
+    llvm::cl::ParseCommandLineOptions(argc, argv, "tinycompiler\n");
 
     llvm::SourceMgr SrcMgr;
     DiagnosticsEngine Diags(SrcMgr);
 
-    auto FileOrErr = llvm::MemoryBuffer::getFile(argv[1]);
+    auto FileOrErr = llvm::MemoryBuffer::getFile(InputFilename);
     if (!FileOrErr) {
-        llvm::errs() << "Error reading file: " << argv[1] << "\n";
+        llvm::errs() << "Error reading file: " << InputFilename << "\n";
         return 1;
     }
 
@@ -199,7 +215,7 @@ int main(int argc, const char **argv) {
         return 1;
     }
 
-    std::string Input = argv[1];
+    std::string Input = InputFilename;
     std::string Stem = Input;
     auto DotPos = Input.rfind('.');
     if (DotPos != std::string::npos)
@@ -219,10 +235,53 @@ int main(int argc, const char **argv) {
     llvm::outs() << "Parsed successfully. AST written to " << OutputPath << "\n";
 
     std::string IRPath = Stem + ".ll";
-    CodeGenerator CG(argv[1]);
+    CodeGenerator CG(InputFilename);
     // classes must be emitted before functions (struct types + ctors used by CodeGen)
     tinyjs::emitClasses(CG.getModule(), Functions);
     CG.run(Functions);
+
+    // run the optimization pipeline if a level > O0 is requested or --passes given
+    if (OptLevel > 0 || !PassPipeline.empty()) {
+        llvm::PassBuilder PB;
+
+        llvm::LoopAnalysisManager LAM;
+        llvm::FunctionAnalysisManager FAM;
+        llvm::CGSCCAnalysisManager CGAM;
+        llvm::ModuleAnalysisManager MAM;
+
+        FAM.registerPass([&] { return PB.buildDefaultAAPipeline(); });
+        PB.registerModuleAnalyses(MAM);
+        PB.registerCGSCCAnalyses(CGAM);
+        PB.registerFunctionAnalyses(FAM);
+        PB.registerLoopAnalyses(LAM);
+        PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+        registerOptimizer(PB);
+
+        llvm::ModulePassManager MPM;
+        if (!PassPipeline.empty()) {
+            if (auto Err = PB.parsePassPipeline(MPM, PassPipeline)) {
+                llvm::errs() << "Error parsing pass pipeline: "
+                             << toString(std::move(Err)) << "\n";
+                return 1;
+            }
+        } else {
+            llvm::StringRef DefaultPipeline;
+            switch (OptLevel) {
+            case 1: DefaultPipeline = "default<O1>"; break;
+            case 2: DefaultPipeline = "default<O2>"; break;
+            case 3: DefaultPipeline = "default<O3>"; break;
+            default: DefaultPipeline = "default<O0>"; break;
+            }
+            if (auto Err = PB.parsePassPipeline(MPM, DefaultPipeline)) {
+                llvm::errs() << "Error building default pipeline: "
+                             << toString(std::move(Err)) << "\n";
+                return 1;
+            }
+        }
+
+        MPM.run(*CG.getModule(), MAM);
+    }
 
     std::error_code EC2;
     llvm::raw_fd_ostream IROut(IRPath, EC2, llvm::sys::fs::OF_None);
@@ -232,6 +291,8 @@ int main(int argc, const char **argv) {
     }
     CG.getModule()->print(IROut, nullptr);
     llvm::outs() << "IR written to " << IRPath << "\n";
+
+    tinyjs::emitTinyCPU(CG.getModule(), Stem + ".s");
 
     return 0;
 }
